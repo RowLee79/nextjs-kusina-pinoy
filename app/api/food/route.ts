@@ -1,0 +1,37 @@
+import {env} from 'cloudflare:workers';
+type B={action?:string;[key:string]:unknown};
+const db=()=>{if(!env.DB)throw Error('Database unavailable');return env.DB};
+const s=(v:unknown,max=200)=>typeof v==='string'?v.trim().slice(0,max):'';
+const n=(v:unknown)=>typeof v==='number'&&Number.isFinite(v)?v:NaN;
+const bad=(error:string,status=400)=>Response.json({error},{status});
+const fail=(e:unknown)=>{console.error('Food API',e);return bad(e instanceof Error&&e.message.includes('UNIQUE constraint')?'That record already exists.':'Request failed. Please try again.',500)};
+const imageKeys=['adobo','lechon','kare','halo','sinigang','pancit','lumpia','sisig'];
+export async function GET(request:Request){try{const d=db(),q=new URL(request.url).searchParams,ref=s(q.get('reference'),30).toUpperCase(),phone=s(q.get('phone'),30);if(ref||phone){if(!ref||!phone)return bad('Enter reference and phone.');const order=await d.prepare('SELECT * FROM orders WHERE reference=? AND phone=?').bind(ref,phone).first<{id:number}>();if(!order)return bad('No order matches this reference and phone.',404);const items=await d.prepare('SELECT * FROM order_items WHERE order_id=? ORDER BY id').bind(order.id).all();return Response.json({order,items:items.results})}
+const [menu,orders,items]=await d.batch([d.prepare('SELECT * FROM menu ORDER BY id'),d.prepare('SELECT * FROM orders ORDER BY id DESC LIMIT 200'),d.prepare('SELECT * FROM order_items WHERE order_id IN (SELECT id FROM orders ORDER BY id DESC LIMIT 200) ORDER BY id')]);return Response.json({menu:menu.results,orders:orders.results,items:items.results})
+}catch(e){return fail(e)}}
+export async function POST(request:Request){let b:B;try{b=await request.json() as B}catch{return bad('Invalid request.')}
+try{const d=db(),now=new Date().toISOString();
+if(b.action==='seed'){const count=await d.prepare('SELECT COUNT(*) AS count FROM menu').first<{count:number}>();if(count?.count)return bad('Menu already loaded.',409);const dishes=[
+['Chicken Adobo','Tender chicken simmered in soy, vinegar, garlic and bay leaves, served with rice.','Mains',24900,'adobo',1],
+['Lechon Kawali','Crispy pork belly with spiced vinegar and house dipping sauce.','Mains',32900,'lechon',1],
+['Beef Kare-Kare','Slow cooked beef in rich peanut sauce with vegetables and bagoong.','Mains',36900,'kare',1],
+['Halo-Halo Special','Shaved ice, sweet beans, fruits, leche flan and ube ice cream.','Desserts',18900,'halo',1],
+['Pork Sinigang','Comforting tamarind broth with pork and fresh vegetables.','Mains',29900,'sinigang',0],
+['Pancit Canton','Wok-tossed noodles with shrimp, vegetables and calamansi.','Noodles',22900,'pancit',0],
+['Lumpiang Shanghai','Golden crisp spring rolls with sweet chili dipping sauce.','Starters',17900,'lumpia',0],
+['Sizzling Pork Sisig','Chopped pork, onions and chili served sizzling with calamansi.','Mains',28900,'sisig',0]];
+await d.batch(dishes.map(x=>d.prepare('INSERT INTO menu(name,description,category,price_cents,image_key,available,featured) VALUES(?,?,?,?,?,1,?)').bind(...x)));return Response.json({message:'Eight Filipino dishes added to the menu.'})}
+if(b.action==='menu'){const name=s(b.name,100),description=s(b.description,400),category=s(b.category,30),price=n(b.priceCents),key=s(b.imageKey,20);if(!name||!description||!category||!Number.isInteger(price)||price<100||price>1e7||!imageKeys.includes(key))return bad('Enter valid menu details.');await d.prepare('INSERT INTO menu(name,description,category,price_cents,image_key,available,featured) VALUES(?,?,?,?,?,1,0)').bind(name,description,category,price,key).run();return Response.json({message:'Dish added.'},{status:201})}
+if(b.action==='availability'){const id=n(b.id),available=n(b.available);if(!Number.isInteger(id)||![0,1].includes(available))return bad('Invalid availability.');const r=await d.prepare('UPDATE menu SET available=? WHERE id=?').bind(available,id).run();return r.meta.changes?Response.json({message:'Menu availability updated.'}):bad('Dish not found.',404)}
+if(b.action==='checkout'){
+ const customerName=s(b.customerName,100),phone=s(b.phone,30),email=s(b.email,120).toLowerCase(),address=s(b.address,250),fulfillment=s(b.fulfillment,20),method=s(b.paymentMethod,30),notes=s(b.notes,500),submitted=b.items;
+ if(!customerName||phone.length<7||email&&!/^\S+@\S+\.\S+$/.test(email)||!['Delivery','Pickup'].includes(fulfillment)||fulfillment==='Delivery'&&!address||!['Cash','GCash on delivery','Pay at pickup'].includes(method)||method==='Pay at pickup'&&fulfillment!=='Pickup'||!Array.isArray(submitted)||!submitted.length||submitted.length>30)return bad('Complete your contact, fulfillment and cart details.');
+ const quantities=new Map<number,number>();for(const item of submitted){if(!item||typeof item!=='object')return bad('Invalid cart item.');const obj=item as Record<string,unknown>,id=n(obj.id),qty=n(obj.quantity);if(!Number.isInteger(id)||!Number.isInteger(qty)||qty<1||qty>50)return bad('Invalid item quantity.');quantities.set(id,(quantities.get(id)||0)+qty)}
+ if([...quantities.values()].some(q=>q>50))return bad('Maximum 50 portions per dish.');const ids=[...quantities.keys()],marks=ids.map(()=>'?').join(',');const menu=await d.prepare(`SELECT id,name,price_cents FROM menu WHERE available=1 AND id IN (${marks})`).bind(...ids).all<{id:number;name:string;price_cents:number}>();if(menu.results.length!==ids.length)return bad('Some dishes are unavailable. Please refresh your cart.',409);
+ const subtotal=menu.results.reduce((v,x)=>v+x.price_cents*(quantities.get(x.id)||0),0),delivery=fulfillment==='Delivery'?(subtotal>=100000?0:7900):0,total=subtotal+delivery,reference='KP-'+crypto.randomUUID().slice(0,8).toUpperCase();
+ const insert=await d.prepare("INSERT INTO orders(reference,customer_name,phone,email,address,fulfillment,payment_method,status,subtotal_cents,delivery_cents,total_cents,notes,created_at) VALUES(?,?,?,?,?,?,?,'Placed',?,?,?,?,?)").bind(reference,customerName,phone,email,address,fulfillment,method,subtotal,delivery,total,notes,now).run();const orderId=insert.meta.last_row_id;
+ await d.batch(menu.results.map(x=>d.prepare('INSERT INTO order_items(order_id,menu_id,name,price_cents,quantity,line_cents) VALUES(?,?,?,?,?,?)').bind(orderId,x.id,x.name,x.price_cents,quantities.get(x.id),x.price_cents*(quantities.get(x.id)||0))));
+ return Response.json({message:'Order placed successfully.',reference,phone,totalCents:total},{status:201})}
+if(b.action==='status'){const id=n(b.id),status=s(b.status,30);if(!Number.isInteger(id)||!['Confirmed','Preparing','Ready','Out for delivery','Completed','Cancelled'].includes(status))return bad('Invalid status.');const old=await d.prepare('SELECT status,fulfillment FROM orders WHERE id=?').bind(id).first<{status:string;fulfillment:string}>();if(!old)return bad('Order not found.',404);const steps=old.fulfillment==='Delivery'?['Placed','Confirmed','Preparing','Ready','Out for delivery','Completed']:['Placed','Confirmed','Preparing','Ready','Completed'];if(status!=='Cancelled'&&steps[steps.indexOf(old.status)+1]!==status||status==='Cancelled'&&!steps.slice(0,-1).includes(old.status))return bad('Invalid order status transition.',409);const r=await d.prepare('UPDATE orders SET status=?,completed_at=? WHERE id=? AND status=?').bind(status,status==='Completed'?now:null,id,old.status).run();return r.meta.changes?Response.json({message:`Order moved to ${status}.`}):bad('Order changed. Refresh and retry.',409)}
+return bad('Unknown action.')
+}catch(e){return fail(e)}}
